@@ -11,28 +11,18 @@ A proxy connector for [hyper][1] based applications.
 ## Example
 
 ```rust,no_run
-extern crate hyper;
-extern crate http;
-extern crate hyper_proxy;
-extern crate futures;
-extern crate tokio;
-extern crate typed_headers;
-
-use hyper::{Chunk, Client, Request, Method, Uri};
+use hyper::{Client, Request, Uri};
 use hyper::client::HttpConnector;
-use futures::{Future, Stream};
 use hyper_proxy::{Proxy, ProxyConnector, Intercept};
-use tokio::runtime::current_thread::Runtime;
 use typed_headers::Credentials;
 
-fn main() {
-    let mut core = Runtime::new().unwrap();
-    
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy = {
         let proxy_uri = "http://my-proxy:8080".parse().unwrap();
         let mut proxy = Proxy::new(Intercept::All, proxy_uri);
         proxy.set_authorization(Credentials::basic("John Doe", "Agent1234").unwrap());
-        let connector = HttpConnector::new(4);
+        let connector = HttpConnector::new();
         let proxy_connector = ProxyConnector::from_proxy(connector, proxy).unwrap();
         proxy_connector
     };
@@ -45,20 +35,21 @@ fn main() {
         req.headers_mut().extend(headers.clone().into_iter());
     }
     let client = Client::builder().build(proxy);
-    let fut_http = client.request(req)
-        .and_then(|res| res.into_body().concat2())
-        .map(move |body: Chunk| ::std::str::from_utf8(&body).unwrap().to_string());
+    let response = client.request(req).await?;
+    if let Some(chunk) = response.into_body().next().await {
+        let chunk = chunk?;
+        println!("{}: {}", uri, std::str::from_utf8(&chunk).unwrap());
+    }
 
     // Connecting to an https uri is straightforward (uses 'CONNECT' method underneath)
-    let uri = "https://my-remote-websitei-secured.com".parse().unwrap();
-    let fut_https = client
-        .get(uri)
-        .and_then(|res| res.into_body().concat2())
-        .map(move |body: Chunk| ::std::str::from_utf8(&body).unwrap().to_string());
+    let uri: Uri = "https://my-remote-websitei-secured.com".parse().unwrap();
+    let response = client.get(uri.clone()).await?;
+    if let Some(chunk) = response.into_body().next().await {
+        let chunk = chunk?;
+        println!("{}: {}", uri, std::str::from_utf8(&chunk).unwrap())
+    }
 
-    let futs = fut_http.join(fut_https);
-
-    let (_http_res, _https_res) = core.block_on(futs).unwrap();
+    Ok(())
 }
 ```
 

@@ -1,11 +1,9 @@
-use bytes::{BufMut, IntoBuf};
-use futures::{Async, Future, Poll};
+use super::io_err;
 use http::HeaderMap;
 use hyper::client::connect::Connected;
-use io_err;
 use std::fmt::{self, Display, Formatter};
-use std::io::{self, Cursor};
-use tokio_io::{AsyncRead, AsyncWrite};
+use std::io;
+use tokio_io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub(crate) struct TunnelConnect {
     buf: Vec<u8>,
@@ -13,33 +11,28 @@ pub(crate) struct TunnelConnect {
 
 impl TunnelConnect {
     /// Change stream
-    pub fn with_stream<S>(self, stream: S, connected: Connected) -> Tunnel<S> {
-        Tunnel {
-            buf: self.buf.into_buf(),
-            stream: Some(stream),
-            connected: Some(connected),
-            state: TunnelState::Writing,
+    pub async fn with_stream<S: AsyncRead + AsyncWrite + Unpin>(
+        mut self,
+        mut stream: S,
+        connected: Connected,
+    ) -> io::Result<(S, Connected)> {
+        stream.write_all(&self.buf).await?;
+        self.buf.truncate(0);
+        stream.read_to_end(&mut self.buf).await?;
+        if (self.buf.starts_with(b"HTTP/1.1 200") || self.buf.starts_with(b"HTTP/1.0 200"))
+            && self.buf.ends_with(b"\r\n\r\n")
+        {
+            Ok((stream, connected.proxy(true)))
+        } else {
+            Err(io_err("unsuccessful tunnel"))
         }
     }
-}
-
-pub(crate) struct Tunnel<S> {
-    buf: Cursor<Vec<u8>>,
-    stream: Option<S>,
-    connected: Option<Connected>,
-    state: TunnelState,
-}
-
-#[derive(Debug)]
-enum TunnelState {
-    Writing,
-    Reading,
 }
 
 struct HeadersDisplay<'a>(&'a HeaderMap);
 
 impl<'a> Display for HeadersDisplay<'a> {
-    fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         for (key, value) in self.0 {
             let value_str = value.to_str().map_err(|_| fmt::Error)?;
             write!(f, "{}: {}\r\n", key.as_str(), value_str)?;
@@ -65,68 +58,22 @@ pub(crate) fn new(host: &str, port: u16, headers: &HeaderMap) -> TunnelConnect {
     TunnelConnect { buf }
 }
 
-impl<S: AsyncRead + AsyncWrite + 'static> Future for Tunnel<S> {
-    type Item = (S, Connected);
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        if self.stream.is_none() || self.connected.is_none() {
-            panic!("must not poll after future is complete")
-        }
-
-        loop {
-            if let TunnelState::Writing = self.state {
-                let n = try_ready!(self.stream.as_mut().unwrap().write_buf(&mut self.buf));
-                if !self.buf.has_remaining_mut() {
-                    self.state = TunnelState::Reading;
-                    self.buf.get_mut().truncate(0);
-                } else if n == 0 {
-                    return Err(io_err("unexpected EOF while tunnel writing"));
-                }
-            } else {
-                let n = try_ready!(self
-                    .stream
-                    .as_mut()
-                    .unwrap()
-                    .read_buf(&mut self.buf.get_mut()));
-                if n == 0 {
-                    return Err(io_err("unexpected EOF while tunnel reading"));
-                } else {
-                    let read = &self.buf.get_ref()[..];
-                    if read.len() > 12 {
-                        if read.starts_with(b"HTTP/1.1 200") || read.starts_with(b"HTTP/1.0 200") {
-                            if read.ends_with(b"\r\n\r\n") {
-                                return Ok(Async::Ready((
-                                    self.stream.take().unwrap(),
-                                    self.connected.take().unwrap().proxy(true),
-                                )));
-                            }
-                        // else read more
-                        } else {
-                            return Err(io_err("unsuccessful tunnel"));
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    extern crate tokio;
-    extern crate tokio_tcp;
-
-    use self::tokio::runtime::current_thread::Runtime;
-    use self::tokio_tcp::TcpStream;
-    use super::{Connected, HeaderMap, Tunnel};
-    use futures::Future;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use super::{Connected, HeaderMap};
+    use std::io::{self, Read, Write};
+    use std::net::{SocketAddr, TcpListener};
     use std::thread;
+    use tokio::net::tcp::TcpStream;
+    use tokio::runtime::current_thread::Runtime;
 
-    fn tunnel<S>(conn: S, host: String, port: u16) -> Tunnel<S> {
-        super::new(&host, port, &HeaderMap::new()).with_stream(conn, Connected::new())
+    async fn work(addr: &SocketAddr) -> io::Result<()> {
+        let tcp = TcpStream::connect(addr).await?;
+        let host = addr.ip().to_string();
+        super::new(&host, addr.port(), &HeaderMap::new())
+            .with_stream(tcp, Connected::new())
+            .await?;
+        Ok(())
     }
 
     #[cfg_attr(rustfmt, rustfmt_skip)]
@@ -169,12 +116,7 @@ mod tests {
         let addr = mock_tunnel!();
 
         let mut core = Runtime::new().unwrap();
-        let work = TcpStream::connect(&addr);
-        let host = addr.ip().to_string();
-        let port = addr.port();
-        let work = work.and_then(|tcp| tunnel(tcp, host, port));
-
-        core.block_on(work).unwrap();
+        assert!(core.block_on(work(&addr)).is_ok());
     }
 
     #[test]
@@ -182,12 +124,7 @@ mod tests {
         let addr = mock_tunnel!(b"HTTP/1.1 200 OK");
 
         let mut core = Runtime::new().unwrap();
-        let work = TcpStream::connect(&addr);
-        let host = addr.ip().to_string();
-        let port = addr.port();
-        let work = work.and_then(|tcp| tunnel(tcp, host, port));
-
-        core.block_on(work).unwrap_err();
+        assert!(core.block_on(work(&addr)).is_err());
     }
 
     #[test]
@@ -195,11 +132,6 @@ mod tests {
         let addr = mock_tunnel!(b"foo bar baz hallo");
 
         let mut core = Runtime::new().unwrap();
-        let work = TcpStream::connect(&addr);
-        let host = addr.ip().to_string();
-        let port = addr.port();
-        let work = work.and_then(|tcp| tunnel(tcp, host, port));
-
-        core.block_on(work).unwrap_err();
+        assert!(core.block_on(work(&addr)).is_err())
     }
 }

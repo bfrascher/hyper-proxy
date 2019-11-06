@@ -2,28 +2,18 @@
 //!
 //! # Example
 //! ```rust,no_run
-//! extern crate hyper;
-//! extern crate http;
-//! extern crate hyper_proxy;
-//! extern crate futures;
-//! extern crate tokio;
-//! extern crate typed_headers;
-//!
-//! use hyper::{Chunk, Client, Request, Method, Uri};
+//! use hyper::{Client, Request, Uri};
 //! use hyper::client::HttpConnector;
-//! use futures::{Future, Stream};
 //! use hyper_proxy::{Proxy, ProxyConnector, Intercept};
-//! use tokio::runtime::current_thread::Runtime;
 //! use typed_headers::Credentials;
 //!
-//! fn main() {
-//!     let mut core = Runtime::new().unwrap();
-//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let proxy = {
 //!         let proxy_uri = "http://my-proxy:8080".parse().unwrap();
 //!         let mut proxy = Proxy::new(Intercept::All, proxy_uri);
 //!         proxy.set_authorization(Credentials::basic("John Doe", "Agent1234").unwrap());
-//!         let connector = HttpConnector::new(4);
+//!         let connector = HttpConnector::new();
 //!         let proxy_connector = ProxyConnector::from_proxy(connector, proxy).unwrap();
 //!         proxy_connector
 //!     };
@@ -36,57 +26,39 @@
 //!         req.headers_mut().extend(headers.clone().into_iter());
 //!     }
 //!     let client = Client::builder().build(proxy);
-//!     let fut_http = client.request(req)
-//!         .and_then(|res| res.into_body().concat2())
-//!         .map(move |body: Chunk| ::std::str::from_utf8(&body).unwrap().to_string());
+//!     let response = client.request(req).await?;
+//!     if let Some(chunk) = response.into_body().next().await {
+//!         let chunk = chunk?;
+//!         println!("{}: {}", uri, std::str::from_utf8(&chunk).unwrap());
+//!     }
 //!
 //!     // Connecting to an https uri is straightforward (uses 'CONNECT' method underneath)
-//!     let uri = "https://my-remote-websitei-secured.com".parse().unwrap();
-//!     let fut_https = client
-//!         .get(uri)
-//!         .and_then(|res| res.into_body().concat2())
-//!         .map(move |body: Chunk| ::std::str::from_utf8(&body).unwrap().to_string());
+//!     let uri: Uri = "https://my-remote-websitei-secured.com".parse().unwrap();
+//!     let response = client.get(uri.clone()).await?;
+//!     if let Some(chunk) = response.into_body().next().await {
+//!         let chunk = chunk?;
+//!         println!("{}: {}", uri, std::str::from_utf8(&chunk).unwrap())
+//!     }
 //!
-//!     let futs = fut_http.join(fut_https);
-//!
-//!     let (_http_res, _https_res) = core.block_on(futs).unwrap();
+//!     Ok(())
 //! }
 //! ```
 
 #![deny(missing_docs)]
 
-extern crate bytes;
-#[macro_use]
-extern crate futures;
-extern crate http;
-extern crate hyper;
-#[cfg(feature = "rustls")]
-extern crate hyper_rustls;
-#[cfg(test)]
-#[cfg(feature = "tls")]
-extern crate hyper_tls;
-#[cfg(feature = "tls")]
-extern crate native_tls;
-extern crate tokio_io;
-#[cfg(feature = "rustls")]
-extern crate tokio_rustls;
-#[cfg(feature = "tls")]
-extern crate tokio_tls;
-extern crate typed_headers;
-#[cfg(feature = "rustls")]
-extern crate webpki;
-
 mod stream;
 mod tunnel;
 
-use futures::Future;
+use futures::future::TryFutureExt;
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::client::connect::{Connect, Connected, Destination};
 use hyper::Uri;
 #[cfg(feature = "tls")]
 use native_tls::TlsConnector as NativeTlsConnector;
 use std::fmt;
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 use std::sync::Arc;
 use stream::ProxyStream;
 #[cfg(feature = "rustls")]
@@ -148,10 +120,10 @@ impl Dst for Destination {
 
 /// A Custom struct to proxy custom uris
 #[derive(Clone)]
-pub struct Custom(Arc<Fn(Option<&str>, Option<&str>, Option<u16>) -> bool + Send + Sync>);
+pub struct Custom(Arc<dyn Fn(Option<&str>, Option<&str>, Option<u16>) -> bool + Send + Sync>);
 
 impl fmt::Debug for Custom {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(f, "_")
     }
 }
@@ -255,7 +227,7 @@ pub struct ProxyConnector<C> {
 }
 
 impl<C: fmt::Debug> fmt::Debug for ProxyConnector<C> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(
             f,
             "ProxyConnector {}{{ proxies: {:?}, connector: {:?} }}",
@@ -376,7 +348,7 @@ macro_rules! unwrap_or_future {
     ($expr:expr) => {
         match $expr {
             std::result::Result::Ok(val) => val,
-            std::result::Result::Err(e) => return Box::new(futures::future::err(e)),
+            std::result::Result::Err(e) => return Box::pin(futures::future::err(e)),
         }
     };
 }
@@ -387,7 +359,8 @@ where
 {
     type Transport = ProxyStream<C::Transport>;
     type Error = io::Error;
-    type Future = Box<Future<Item = (Self::Transport, Connected), Error = Self::Error> + Send>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<(Self::Transport, Connected), Self::Error>> + Send>>;
 
     fn connect(&self, dst: Destination) -> Self::Future {
         if let Some(ref p) = self.match_proxy(&dst) {
@@ -406,54 +379,52 @@ where
                     #[cfg(feature = "tls")]
                     Some(tls) => {
                         let tls = tls.clone();
-                        Box::new(
-                            proxy_stream
-                                .and_then(move |(io, _)| {
-                                    let tls = TlsConnector::from(tls);
-                                    tls.connect(&host, io).map_err(io_err)
-                                })
-                                .map(|s| (ProxyStream::Secured(s), Connected::new().proxy(true))),
-                        )
+                        Box::pin(async move {
+                            let (io, _) = proxy_stream.await?;
+                            let s = TlsConnector::from(tls)
+                                .connect(&host, io)
+                                .await
+                                .map_err(io_err)?;
+                            Ok((ProxyStream::Secured(s), Connected::new().proxy(true)))
+                        })
                     }
                     #[cfg(feature = "rustls")]
                     Some(tls) => {
                         let tls = tls.clone();
-                        let dnsref = unwrap_or_future!(DNSNameRef::try_from_ascii_str(&host)
-                            .map(|r| r.to_owned())
-                            .map_err(|()| io_err_from_str("invalid hostname")));
-
-                        Box::new(
-                            proxy_stream
-                                .and_then(move |(io, _)| {
-                                    let tls = TlsConnector::from(tls);
-                                    tls.connect(dnsref.as_ref(), io).map_err(io_err)
-                                })
-                                .map(|s| (ProxyStream::Secured(s), Connected::new().proxy(true))),
-                        )
+                        Box::pin(async move {
+                            let dnsref = DNSNameRef::try_from_ascii_str(&host)
+                                .map_err(|_| io_err_from_str("invalid hostname"))?;
+                            let (io, _) = proxy_stream.await?;
+                            let s = TlsConnector::from(tls)
+                                .connect(dnsref, io)
+                                .await
+                                .map_err(io_err)?;
+                            Ok((ProxyStream::Secured(s), Connected::new().proxy(true)))
+                        })
                     }
                     #[cfg(not(any(feature = "tls", feature = "rustls")))]
                     Some(_) => panic!("hyper-proxy was not built with TLS support"),
 
-                    None => Box::new(proxy_stream.map(|(s, c)| (ProxyStream::Regular(s), c))),
+                    None => Box::pin(proxy_stream.map_ok(|(s, c)| (ProxyStream::Regular(s), c))),
                 }
             } else {
                 // without TLS, there is absolutely zero benefit from tunneling, as the proxy can
                 // read the plaintext traffic. Thus, tunneling is just restrictive to the proxies
                 // resources.
                 let proxy_dst = unwrap_or_future!(proxy_dst(&dst, &p.uri));
-                Box::new(
+                Box::pin(
                     self.connector
                         .connect(proxy_dst)
                         .map_err(io_err)
-                        .map(|(s, c)| (ProxyStream::Regular(s), Connected::new().proxy(true))),
+                        .map_ok(|(s, _)| (ProxyStream::Regular(s), Connected::new().proxy(true))),
                 )
             }
         } else {
-            Box::new(
+            Box::pin(
                 self.connector
                     .connect(dst)
                     .map_err(io_err)
-                    .map(|(s, c)| (ProxyStream::Regular(s), c)),
+                    .map_ok(|(s, c)| (ProxyStream::Regular(s), c)),
             )
         }
     }
@@ -475,10 +446,11 @@ fn proxy_dst(dst: &Destination, proxy: &Uri) -> io::Result<Destination> {
 }
 
 #[inline]
-fn io_err<E: Into<Box<::std::error::Error + Send + Sync>>>(e: E) -> io::Error {
+fn io_err<E: Into<Box<dyn ::std::error::Error + Send + Sync>>>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
 }
 
+#[cfg(feature = "rustls")]
 #[inline]
 fn io_err_from_str(e: &str) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)

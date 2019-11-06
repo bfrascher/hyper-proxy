@@ -3,6 +3,7 @@ name = "hyper-proxy"
 version = "0.5.1"
 authors = ["Johann Tuffe <tafia973@gmail.com>"]
 description = "A proxy connector for Hyper-based applications"
+edition = "2018"
 
 documentation = "https://docs.rs/hyper-proxy"
 repository = "https://github.com/tafia/hyper-proxy"
@@ -14,21 +15,19 @@ license = "MIT"
 
 [dependencies]
 http = "0.1"
-hyper = "0.12"
-futures = "0.1.17"
-tokio-io = "0.1.6"
-bytes = "0.4.6"
-tokio-tls = { version = "0.2", optional=true }
-hyper-tls = { version = "0.3", optional=true }
+hyper = "0.13.0-alpha.4"
+futures-preview = "0.3.0-alpha.19"
+tokio-io = "0.2.0-alpha.6"
+tokio-tls = { version = "0.3.0-alpha.6", optional=true }
+hyper-tls = { version = "0.4.0-alpha.4", optional=true }
 native-tls = { version = "0.2", optional=true }
-tokio-rustls = { version = "0.9", optional=true }
-hyper-rustls = { version = "0.16", optional=true }
-webpki = { version = "0.19", optional=true }
+tokio-rustls = { version = "0.12.0-alpha.6", optional=true }
+hyper-rustls = { version = "0.18.0-alpha.2", optional=true }
+webpki = { version = "0.21", optional=true }
 typed-headers = "0.1"
 
 [dev-dependencies]
-tokio = "0.1"
-tokio-tcp = "0.1"
+tokio = "0.2.0-alpha.6"
 
 [features]
 tls = ["tokio-tls", "hyper-tls", "native-tls"]
